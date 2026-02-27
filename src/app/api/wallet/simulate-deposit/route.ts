@@ -21,7 +21,6 @@ export async function POST(request: NextRequest) {
   }
 
   const currency = body.currency as Currency | undefined
-
   if (!currency || !CURRENCIES.includes(currency)) {
     return NextResponse.json(
       { error: `currency must be one of: ${CURRENCIES.join(', ')}` },
@@ -29,112 +28,64 @@ export async function POST(request: NextRequest) {
     )
   }
 
-  const amountToAdd = SIMULATE_AMOUNTS[currency]
+  const amountToAdd = parseFloat(SIMULATE_AMOUNTS[currency])
   const depositAddress = generateDepositAddress(user.id, currency)
 
-  // Upsert wallet row (create if not exists), then increment balance
-  // Step 1: Ensure the wallet row exists
-  const { error: upsertError } = await supabase
+  // Step 1: Ensure wallet row exists (upsert with ignoreDuplicates)
+  await supabase
     .from('wallets')
     .upsert(
-      {
-        user_id: user.id,
-        currency,
-        balance: 0,
-        deposit_address: depositAddress,
-      },
+      { user_id: user.id, currency, balance: 0, deposit_address: depositAddress },
       { onConflict: 'user_id,currency', ignoreDuplicates: true },
     )
 
-  if (upsertError) {
-    console.error('[simulate-deposit] upsert error:', upsertError)
-    return NextResponse.json({ error: 'Failed to initialize wallet' }, { status: 500 })
+  // Step 2: Fetch current balance
+  const { data: wallet, error: fetchError } = await supabase
+    .from('wallets')
+    .select('balance')
+    .eq('user_id', user.id)
+    .eq('currency', currency)
+    .single()
+
+  if (fetchError || !wallet) {
+    console.error('[simulate-deposit] fetch error:', fetchError)
+    return NextResponse.json({ error: 'Failed to fetch wallet' }, { status: 500 })
   }
 
-  // Step 2: Increment balance using Postgres arithmetic (safe for concurrency)
-  const { data: updatedWallet, error: updateError } = await supabase
+  // Step 3: Compute new balance and update
+  const newBalance = (parseFloat(wallet.balance) + amountToAdd).toFixed(8)
+
+  const { data: updated, error: updateError } = await supabase
     .from('wallets')
-    .update({ balance: supabase.rpc('increment_balance', { 
-      // Use raw SQL increment via a workaround: fetch then update
-    }) })
+    .update({ balance: newBalance })
     .eq('user_id', user.id)
     .eq('currency', currency)
     .select('balance')
     .single()
 
-  // Fallback: fetch current balance then set balance = current + amount
-  if (updateError || !updatedWallet) {
-    // Fetch current balance
-    const { data: currentWallet, error: fetchError } = await supabase
-      .from('wallets')
-      .select('balance')
-      .eq('user_id', user.id)
-      .eq('currency', currency)
-      .single()
-
-    if (fetchError || !currentWallet) {
-      console.error('[simulate-deposit] fetch error:', fetchError)
-      return NextResponse.json({ error: 'Failed to fetch wallet' }, { status: 500 })
-    }
-
-    const newBalance = (parseFloat(currentWallet.balance) + parseFloat(amountToAdd)).toFixed(8)
-
-    const { data: finalWallet, error: finalError } = await supabase
-      .from('wallets')
-      .update({ balance: newBalance })
-      .eq('user_id', user.id)
-      .eq('currency', currency)
-      .select('balance')
-      .single()
-
-    if (finalError || !finalWallet) {
-      console.error('[simulate-deposit] update error:', finalError)
-      return NextResponse.json({ error: 'Failed to update balance' }, { status: 500 })
-    }
-
-    // Insert confirmed deposit transaction
-    const { error: txError } = await supabase
-      .from('transactions')
-      .insert({
-        user_id: user.id,
-        currency,
-        type: 'deposit',
-        amount: amountToAdd,
-        destination_address: null,
-        status: 'confirmed',
-      })
-
-    if (txError) {
-      console.error('[simulate-deposit] transaction insert error:', txError)
-      // Non-fatal — balance was updated, just log
-    }
-
-    return NextResponse.json({
-      currency,
-      amount_added: amountToAdd,
-      new_balance: parseFloat(finalWallet.balance).toFixed(8),
-    })
+  if (updateError || !updated) {
+    console.error('[simulate-deposit] update error:', updateError)
+    return NextResponse.json({ error: 'Failed to update balance' }, { status: 500 })
   }
 
-  // Insert confirmed deposit transaction
-  const { error: txError } = await supabase
-    .from('transactions')
-    .insert({
-      user_id: user.id,
-      currency,
-      type: 'deposit',
-      amount: amountToAdd,
-      destination_address: null,
-      status: 'confirmed',
-    })
+  // Step 4: Insert confirmed deposit transaction
+  const { error: txError } = await supabase.from('transactions').insert({
+    user_id: user.id,
+    currency,
+    type: 'deposit',
+    amount: SIMULATE_AMOUNTS[currency],
+    destination_address: null,
+    status: 'confirmed',
+  })
 
   if (txError) {
-    console.error('[simulate-deposit] transaction insert error:', txError)
+    // Non-fatal: balance already updated — log and continue
+    console.error('[simulate-deposit] tx insert error:', txError)
   }
 
   return NextResponse.json({
     currency,
-    amount_added: amountToAdd,
-    new_balance: parseFloat(updatedWallet.balance).toFixed(8),
+    amount_added: SIMULATE_AMOUNTS[currency],
+    new_balance: parseFloat(updated.balance).toFixed(8),
   })
 }
